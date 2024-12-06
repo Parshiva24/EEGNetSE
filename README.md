@@ -1,0 +1,2 @@
+# EEGScaler
+MI Direction Decoding 
