@@ -1,2 +1,2 @@
-# EEGScaler
+# EEGNetSE
 MI Direction Decoding 
