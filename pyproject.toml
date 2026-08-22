@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eegnetse"
+version = "0.1.0"
+description = "Subject-specific EEGNet-SE for motor-imagery direction decoding"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "scikit-learn",
+    "torch>=1.12",
+]
+
+[project.optional-dependencies]
+analysis = ["matplotlib", "pandas", "thop"]
+
+[tool.setuptools.packages.find]
+include = ["eegnetse*"]

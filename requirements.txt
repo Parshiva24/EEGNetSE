@@ -1,0 +1,9 @@
+# Core runtime dependencies.
+# Install PyTorch matching your CUDA toolkit from https://pytorch.org first,
+# then `pip install -r requirements.txt`.
+numpy
+scipy
+scikit-learn
+torch>=1.12
+
+# Optional (figures, complexity table): pip install matplotlib pandas thop
