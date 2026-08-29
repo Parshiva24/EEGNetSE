@@ -1,5 +1,8 @@
 # Results
 
+**Detailed per-subject write-up:** [`model_performance.md`](model_performance.md)
+(base / fine-tuned / scratch, with method notes and manuscript cross-reference).
+
 ## Table III — Ablation: from-scratch vs. transfer learning
 
 Reviewer response (Section 3.2 of the revision). Three training regimes evaluated
