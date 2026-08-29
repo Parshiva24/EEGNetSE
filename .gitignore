@@ -11,6 +11,8 @@ __pycache__/
 
 # Files
 *.csv
+# ...but keep committed experiment results (e.g. the reviewer-response ablation)
+!results/*.csv
 *.xlsx
 *.doc
 *.docx

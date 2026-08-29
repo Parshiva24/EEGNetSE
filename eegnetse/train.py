@@ -20,7 +20,10 @@ from __future__ import annotations
 
 import argparse
 import copy
+import csv
 from pathlib import Path
+
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -28,7 +31,7 @@ import torch.optim as optim
 from sklearn.model_selection import train_test_split
 
 from eegnetse.core import (
-    BANDPASS, DATA_DIR, ONLINE_SUBJECTS,
+    BANDPASS, DATA_DIR, MODEL_DIR, ONLINE_SUBJECTS,
     build_model, calibration_dataset, get_device, make_loader,
     online_session, set_seed, set_trainable,
 )
@@ -109,16 +112,29 @@ def pretrain_base(data_dir=DATA_DIR, device=None, *, fcut=BANDPASS, lr=1e-4,
 # --------------------------------------------------------------------------- #
 # Stage 2
 # --------------------------------------------------------------------------- #
+def _subject_loaders(subject, data_dir, fcut, val_ratio, seed):
+    """Train/val loaders from a subject's calibration trials (72 trials)."""
+    Xtr, Ytr, _, _ = online_session(data_dir, subject)
+    Xt, Xv, Yt, Yv = train_test_split(
+        Xtr, Ytr, train_size=1 - val_ratio, random_state=seed, shuffle=True, stratify=Ytr)
+    train_loader = make_loader(Xt, Yt, batch_size=32, shuffle=True, fcut=fcut)
+    val_loader = make_loader(Xv, Yv, batch_size=len(Yv), fcut=fcut)
+    return train_loader, val_loader
+
+
+def _evaluate_online(model, subject, data_dir, device, fcut):
+    """Accuracy of an in-memory model on a subject's held-out online session."""
+    _, _, X_online, Y_online = online_session(data_dir, subject)
+    loader = make_loader(X_online, Y_online, batch_size=len(Y_online), fcut=fcut)
+    return _evaluate(model, loader, device)
+
+
 def finetune_subject(base_state, subject, data_dir=DATA_DIR, device=None, *,
                      dense=True, fcut=BANDPASS, lr=1e-3, max_epochs=1000,
                      val_ratio=0.2, seed=0, verbose=False):
     device = device or get_device()
     set_seed(seed)
-    Xtr, Ytr, _, _ = online_session(data_dir, subject)   # subject calibration trials
-    Xt, Xv, Yt, Yv = train_test_split(
-        Xtr, Ytr, train_size=1 - val_ratio, random_state=seed, shuffle=True, stratify=Ytr)
-    train_loader = make_loader(Xt, Yt, batch_size=32, shuffle=True, fcut=fcut)
-    val_loader = make_loader(Xv, Yv, batch_size=len(Yv), fcut=fcut)
+    train_loader, val_loader = _subject_loaders(subject, data_dir, fcut, val_ratio, seed)
 
     model = build_model().to(device)
     model.load_state_dict(copy.deepcopy(base_state))
@@ -129,14 +145,93 @@ def finetune_subject(base_state, subject, data_dir=DATA_DIR, device=None, *,
     return model, acc, n_trainable
 
 
+def train_from_scratch(subject, data_dir=DATA_DIR, device=None, *, fcut=BANDPASS,
+                       lr=1e-3, max_epochs=1000, val_ratio=0.2, seed=0, verbose=False):
+    """Regime (a): train the full EEGNet-SE from random init on one subject's
+    72 calibration trials only (no cross-subject pre-training)."""
+    device = device or get_device()
+    set_seed(seed)
+    train_loader, val_loader = _subject_loaders(subject, data_dir, fcut, val_ratio, seed)
+    model = build_model().to(device)                 # random init, all layers trainable
+    model, acc = train_model(model, train_loader, val_loader, device,
+                             lr=lr, max_epochs=max_epochs, verbose=verbose)
+    return model, acc
+
+
+# --------------------------------------------------------------------------- #
+# Ablation: from-scratch vs. transfer learning  (reviewer response, Table III)
+# --------------------------------------------------------------------------- #
+def run_ablation(data_dir=DATA_DIR, model_dir=MODEL_DIR, out_dir=None, device=None, *,
+                 fcut=BANDPASS, subjects=None, lr=1e-3, max_epochs=1000, seed=0,
+                 save_models=True, csv_path=None, verbose=False):
+    """Compare the three training regimes on each subject's online session.
+
+        (a) from_scratch : full EEGNet-SE trained on the subject's 72 calib trials
+        (b) base_only    : subject-independent base (S01-S07), no fine-tuning
+        (c) two_stage    : proposed base + SE/Dense fine-tuning  (committed checkpoint)
+
+    Regimes (b) and (c) reuse the committed checkpoints in ``model_dir``; (a) is
+    trained here.  Writes a per-subject CSV (Table III) and returns the rows.
+    """
+    from eegnetse.infer import evaluate_checkpoint
+
+    device = device or get_device()
+    subjects = list(subjects) if subjects is not None else list(ONLINE_SUBJECTS)
+    model_dir = Path(model_dir)
+    if save_models and out_dir is not None:
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    print(f"{'subj':>4} | {'(a) scratch':>11} | {'(b) base':>9} | {'(c) two-stage':>13}")
+    print("-" * 48)
+    for s in subjects:
+        model, _ = train_from_scratch(s, data_dir, device, fcut=fcut, lr=lr,
+                                      max_epochs=max_epochs, seed=seed, verbose=verbose)
+        a = _evaluate_online(model, s, data_dir, device, fcut)
+        if save_models and out_dir is not None:
+            torch.save(model.state_dict(), Path(out_dir) / f"scratch_sub{s:02d}.pth")
+        b = evaluate_checkpoint(model_dir / BASE_NAME, s, data_dir, device, fcut)
+        c = evaluate_checkpoint(model_dir / _tuned_name(s, True), s, data_dir, device, fcut)
+        rows.append({"subject": s, "from_scratch": a, "base_only": b, "two_stage": c})
+        print(f"S{s:02d}  | {a:11.2f} | {b:9.2f} | {c:13.2f}")
+
+    def _col(key):
+        return np.array([r[key] for r in rows])
+
+    print("-" * 48)
+    means = {k: _col(k).mean() for k in ("from_scratch", "base_only", "two_stage")}
+    stds = {k: _col(k).std() for k in ("from_scratch", "base_only", "two_stage")}
+    print(f"mean | {means['from_scratch']:11.2f} | {means['base_only']:9.2f} | {means['two_stage']:13.2f}")
+    print(f"std  | {stds['from_scratch']:11.2f} | {stds['base_only']:9.2f} | {stds['two_stage']:13.2f}")
+
+    if csv_path is not None:
+        csv_path = Path(csv_path)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(csv_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["subject", "from_scratch", "base_only", "two_stage"])
+            for r in rows:
+                w.writerow([f"S{r['subject']:02d}", f"{r['from_scratch']:.2f}",
+                            f"{r['base_only']:.2f}", f"{r['two_stage']:.2f}"])
+            w.writerow(["mean", f"{means['from_scratch']:.2f}",
+                        f"{means['base_only']:.2f}", f"{means['two_stage']:.2f}"])
+            w.writerow(["std", f"{stds['from_scratch']:.2f}",
+                        f"{stds['base_only']:.2f}", f"{stds['two_stage']:.2f}"])
+        print(f"\nwrote {csv_path}")
+    return rows
+
+
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def main(argv=None):
     p = argparse.ArgumentParser(description="Train EEGNet-SE (base + per-subject fine-tuning).")
-    p.add_argument("--stage", choices=["base", "finetune", "all"], default="all")
+    p.add_argument("--stage", choices=["base", "finetune", "all", "ablation"], default="all")
     p.add_argument("--data-dir", default=str(DATA_DIR))
+    p.add_argument("--model-dir", default=str(MODEL_DIR),
+                   help="committed checkpoints used for regimes (b)/(c) in the ablation")
     p.add_argument("--out-dir", default=str(Path(__file__).resolve().parent.parent / "outputs"))
+    p.add_argument("--results-dir", default=str(Path(__file__).resolve().parent.parent / "results"))
     p.add_argument("--subjects", default="8-20", help="e.g. '8-20' or '8,9,10'")
     p.add_argument("--dense", dest="dense", action="store_true", default=True,
                    help="fine-tune SE + Dense (default; the proposed configuration)")
@@ -153,6 +248,14 @@ def main(argv=None):
     out_dir.mkdir(parents=True, exist_ok=True)
     subjects = _parse_subjects(args.subjects)
     print(f"device={device}  band={fcut}  out_dir={out_dir}")
+
+    if args.stage == "ablation":
+        print("[ablation] from-scratch (a) vs base-only (b) vs two-stage (c) ...")
+        run_ablation(args.data_dir, args.model_dir, out_dir, device, fcut=fcut,
+                     subjects=subjects, max_epochs=args.max_epochs, seed=args.seed,
+                     csv_path=Path(args.results_dir) / "table3_ablation.csv",
+                     verbose=args.verbose)
+        return
 
     base_path = out_dir / BASE_NAME
     if args.stage in ("base", "all"):
